@@ -43,14 +43,16 @@ def create_jvs_metadata(jvs_dir, md_dir):
         sound_files = glob.glob(os.path.join(jvs_dir, speaker, '**/*.wav'),
                                 recursive=True)
         for sound in sound_files:
-            dur = len(sf.SoundFile(sound))
-            if 'parallel' in sound:
+            if 'parallel100' in sound:
+                dur = len(sf.SoundFile(sound))
                 row = [speaker, speakers[speaker], 'parallel',
                        dur, sound.replace(jvs_dir+'/', '')]
-            elif 'nonpara' in sound:
+                jvs_metadata = jvs_metadata.append([row])
+            elif 'nonpara30' in sound:
+                dur = len(sf.SoundFile(sound))
                 row = [speaker, speakers[speaker], 'non-parallel',
                        dur, sound.replace(jvs_dir+'/', '')]
-            jvs_metadata = jvs_metadata.append([row])
+                jvs_metadata = jvs_metadata.append([row])
     jvs_metadata.columns = ['speaker_id', 'gender', 'subset', 
                             'length', 'path']
     jvs_metadata.to_csv(os.path.join(md_dir, 'jvs_metadata.csv'), index=None)
