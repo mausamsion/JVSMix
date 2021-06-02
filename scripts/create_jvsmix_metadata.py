@@ -1,13 +1,18 @@
 import os
 import argparse
 import random
+import glob
 import itertools
-import soundfile as sf
-import pyloudnorm as pyln
+import time
 import pandas as pd
 import numpy as np
+import soundfile as sf
+import pyloudnorm as pyln
 import warnings
 from tqdm import tqdm
+from codetiming import Timer
+import multiprocessing
+from loky import get_reusable_executor
 
 # Global parameters
 EPS = 1e-10             # secures log and division
@@ -15,14 +20,21 @@ MAX_AMP = 0.9           # max amplitude in sources and mixture
 RATE = 24000            # JVS has all the sources at 24KHz
 MIN_LOUDNESS = -33      # loudness randomized between this min and max
 MAX_LOUDNESS = -25
+n_cpu = multiprocessing.cpu_count()
 
 random.seed(673)        # sum([ord(ch) for ch in 'jvsmix'])
 
 def main(args):
-    create_jvsmix_metadata(args.jvs_dir, args.jvs_md_file, args.md_dir, 
-                           args.jsut_name_file, args.n_src)
+    if args.multiproc:
+        create_jvsmix_metadata_multiproc(args.jvs_dir, args.jvs_md_file, 
+                                         args.md_dir, args.jsut_name_file, 
+                                         args.n_src)
+    else:
+        create_jvsmix_metadata(args.jvs_dir, args.jvs_md_file, args.md_dir, 
+                               args.jsut_name_file, args.n_src)
 
 
+@Timer(name='decorator')
 def create_jvsmix_metadata(jvs_dir, jvs_md_file, md_dir, jsut_name_file, n_src):
     dataset = f'jvs{n_src}mix'
     try: 
@@ -34,7 +46,6 @@ def create_jvsmix_metadata(jvs_dir, jvs_md_file, md_dir, jsut_name_file, n_src):
     jsut_name = jsut_name.set_index(0).to_dict()[1]
     # Generate speaker combinations
     speaker_combs = make_combs(jvs_md, n_src)
-    
     # Create and save empty dataframes as CSVs
     mixture_md_cols = ['mixture_id']
     mixture_info_cols = ['mixture_id']
@@ -47,20 +58,20 @@ def create_jvsmix_metadata(jvs_dir, jvs_md_file, md_dir, jsut_name_file, n_src):
     mixture_info = pd.DataFrame(columns=mixture_info_cols)
     
     # Create metadata for each subset with all speakers
-    for subset in ['parallel', 'non-parallel']:
-        clip_counter = 0
+    for subset in ['non-parallel', 'parallel']:
         save_path = os.path.join(md_dir, dataset, dataset+'_'+subset)
         mixture_md.to_csv(save_path+'.csv', index=None)
         mixture_info.to_csv(save_path+'_info.csv', index=None)
-        
+        counter = 0
         for comb in tqdm(speaker_combs, total=len(speaker_combs)):
             sources_info, sources_list_max = read_sources(
-                                                jvs_md, comb, n_src,
-                                                jvs_dir, jsut_name, subset)
+                                                comb, jvs_md, jvs_dir, 
+                                                jsut_name, n_src, subset)
             # Compute original loudness and normalized sources
             loudness, _, sources_list_norm = set_loudness(sources_list_max)
             # Create mixture
             mixtures = mix(sources_list_norm)
+            # Check for clipping and renormalize if needed
             renormalize_loudness, did_clip = check_for_clipping(
                                                 mixtures, sources_list_norm)
             # Keep track of number of clippings done
@@ -77,6 +88,103 @@ def create_jvsmix_metadata(jvs_dir, jvs_md_file, md_dir, jsut_name_file, n_src):
         # print(f'Among {len(mixture_md)} mixtures, {clip_counter} clipped.')
 
 
+@Timer(name='decorator')
+def create_jvsmix_metadata_multiproc(jvs_dir, jvs_md_file, md_dir, 
+                                     jsut_name_file, n_src):
+    def do_multiproc(arg_list):
+        comb = arg_list[0]
+        jvs_md = arg_list[1]
+        jvs_dir = arg_list[2]
+        jsut_name = arg_list[3]
+        n_src = arg_list[4]
+        subset = arg_list[5]
+        save_path = arg_list[6]
+        save_id = arg_list[7]
+
+        sources_info, sources_list_max = read_sources(comb, jvs_md, jvs_dir,
+                                                    jsut_name, n_src, subset)
+        # Compute original loudness and normalized sources
+        loudness, _, sources_list_norm = set_loudness(sources_list_max)
+        # Create mixture
+        mixtures = mix(sources_list_norm)
+        # Check for clipping and renormalize if needed
+        renormalize_loudness, did_clip = check_for_clipping(
+            mixtures, sources_list_norm)
+        # Keep track of number of clippings done
+        # clip_counter += sum([int(i) for i in did_clip])
+        # Compute gain
+        gains_list = compute_gain(loudness, renormalize_loudness)
+        # Add all the info to dataframe
+        tmp_mix_md_df, tmp_mix_info_df = get_dfs(sources_info, gains_list, n_src)
+        # Save interim results to file
+        tmp_mix_md_df.to_csv(
+            os.path.join(save_path, f'{os.getpid()}_{save_id}.csv'),
+            index=None, header=None)
+        tmp_mix_info_df.to_csv(
+            os.path.join(save_path, f'{os.getpid()}_{save_id}_info.csv'),
+            index=None, header=None)
+    
+    dataset = f'jvs{n_src}mix'
+    try:
+        os.mkdir(os.path.join(md_dir, dataset))
+    except:
+        pass
+    jvs_md = pd.read_csv(jvs_md_file, engine='python')
+    jsut_name = pd.read_csv(jsut_name_file, header=None, engine='python')
+    jsut_name = jsut_name.set_index(0).to_dict()[1]
+    # Generate speaker combinations
+    speaker_combs = make_combs(jvs_md, n_src)
+    # Create and save empty dataframes as CSVs
+    mixture_md_cols = ['mixture_id']
+    mixture_info_cols = ['mixture_id']
+    for i in range(n_src):
+        mixture_md_cols.append(f'source_{i + 1}_path')
+        mixture_md_cols.append(f'source_{i + 1}_gain')
+        mixture_info_cols.append(f'speaker_{i + 1}_id')
+        mixture_info_cols.append(f'speaker_{i + 1}_gender')
+    mixture_md = pd.DataFrame(columns=mixture_md_cols)
+    mixture_info = pd.DataFrame(columns=mixture_info_cols)
+
+    # Create 'tmp' directory for multiprocess results
+    try:
+        os.mkdir(os.path.join(md_dir, dataset, 'tmp'))
+    except:
+        pass
+    # Create metadata for each subset with all speakers
+    for subset in ['non-parallel', 'parallel']:
+        clip_counter = 0
+        save_path = os.path.join(md_dir, dataset, dataset+'_'+subset)
+        mixture_md.to_csv(save_path+'.csv', index=None)
+        mixture_info.to_csv(save_path+'_info.csv', index=None)
+
+        subargs = [jvs_md, jvs_dir, jsut_name, n_src, subset, 
+                   os.path.join(os.path.split(save_path)[0], 'tmp')]
+        arg_list = []
+        for i, comb in enumerate(speaker_combs):
+            arg_list.append([comb]+subargs+[i])
+        arg_list = arg_list[:100]
+        executor = get_reusable_executor(max_workers=int(n_cpu*0.75), timeout=5)
+        with tqdm(total=len(arg_list)) as pbar:
+            for i, _ in enumerate(executor.map(do_multiproc, arg_list)):
+                pbar.update()
+
+        time.sleep(1)
+        # Consolidate results from multiple processes saved inside 'tmp'
+        print('Consolidating results...')
+        tmp_csvs = glob.glob(os.path.join(
+            os.path.split(save_path)[0], 'tmp', '*.csv'))
+        for tc in tqdm(tmp_csvs, total=len(tmp_csvs)):
+            tmp_df = pd.read_csv(tc, header=None)
+            if 'info' in tc:
+                tmp_df.to_csv(save_path+'_info.csv', 
+                              index=None, header=None, mode='a')
+            else:
+                tmp_df.to_csv(save_path+'.csv',
+                              index=None, header=None, mode='a')
+        # os.system('rm -rf ' + os.path.join(save_path, 'tmp'))
+        break
+
+
 def make_combs(jvs_md, n_src):
     speakers = list(set(jvs_md['speaker_id']))
     # As number of speakers are less, we are making all possible speaker
@@ -85,7 +193,7 @@ def make_combs(jvs_md, n_src):
     return speaker_combs
 
 
-def read_sources(jvs_md, comb, n_src, jvs_dir, jsut_name, subset):
+def read_sources(comb, jvs_md, jvs_dir, jsut_name, n_src, subset):
     subdfs = [jvs_md[ (jvs_md['speaker_id']==comb[i]) & 
                       (jvs_md['subset']==subset) ] for i in range(n_src)]
     # Get sources info
@@ -242,5 +350,7 @@ if __name__=='__main__':
                         help='Absolute path of file having JSUT audio naming')
     parser.add_argument('--n_src', type=int, required=True, 
                         help='Number of sources to create the mixture for')
+    parser.add_argument('--multiproc', type=bool, default=False, 
+                        help='Whether to do multiprocessing(default=False)')
     args = parser.parse_args()
     main(args)
