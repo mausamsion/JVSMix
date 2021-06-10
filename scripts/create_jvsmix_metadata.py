@@ -37,10 +37,7 @@ def main(args):
 @Timer(name='decorator')
 def create_jvsmix_metadata(jvs_dir, jvs_md_file, md_dir, jsut_name_file, n_src):
     dataset = f'jvs{n_src}mix'
-    try: 
-        os.mkdir(os.path.join(md_dir, dataset))
-    except: 
-        pass
+    os.makedirs(os.path.join(md_dir, dataset), exist_ok=True)
     jvs_md = pd.read_csv(jvs_md_file, engine='python')
     jsut_name = pd.read_csv(jsut_name_file, header=None, engine='python')
     jsut_name = jsut_name.set_index(0).to_dict()[1]
@@ -59,10 +56,12 @@ def create_jvsmix_metadata(jvs_dir, jvs_md_file, md_dir, jsut_name_file, n_src):
     
     # Create metadata for each subset with all speakers
     for subset in ['non-parallel', 'parallel']:
+        print('--- Subset:', subset)
+        clip_counter = 0
         save_path = os.path.join(md_dir, dataset, dataset+'_'+subset)
         mixture_md.to_csv(save_path+'.csv', index=None)
         mixture_info.to_csv(save_path+'_info.csv', index=None)
-        counter = 0
+        
         for comb in tqdm(speaker_combs, total=len(speaker_combs)):
             sources_info, sources_list_max = read_sources(
                                                 comb, jvs_md, jvs_dir, 
@@ -125,10 +124,7 @@ def create_jvsmix_metadata_multiproc(jvs_dir, jvs_md_file, md_dir,
             index=None, header=None)
     
     dataset = f'jvs{n_src}mix'
-    try:
-        os.mkdir(os.path.join(md_dir, dataset))
-    except:
-        pass
+    os.makedirs(os.path.join(md_dir, dataset), exist_ok=True)
     jvs_md = pd.read_csv(jvs_md_file, engine='python')
     jsut_name = pd.read_csv(jsut_name_file, header=None, engine='python')
     jsut_name = jsut_name.set_index(0).to_dict()[1]
@@ -146,12 +142,10 @@ def create_jvsmix_metadata_multiproc(jvs_dir, jvs_md_file, md_dir,
     mixture_info = pd.DataFrame(columns=mixture_info_cols)
 
     # Create 'tmp' directory for multiprocess results
-    try:
-        os.mkdir(os.path.join(md_dir, dataset, 'tmp'))
-    except:
-        pass
+    os.makedirs(os.path.join(md_dir, dataset, 'tmp'), exist_ok=True)
     # Create metadata for each subset with all speakers
     for subset in ['non-parallel', 'parallel']:
+        print('--- Subset:', subset)
         clip_counter = 0
         save_path = os.path.join(md_dir, dataset, dataset+'_'+subset)
         mixture_md.to_csv(save_path+'.csv', index=None)
@@ -162,7 +156,7 @@ def create_jvsmix_metadata_multiproc(jvs_dir, jvs_md_file, md_dir,
         arg_list = []
         for i, comb in enumerate(speaker_combs):
             arg_list.append([comb]+subargs+[i])
-        arg_list = arg_list[:100]
+        
         executor = get_reusable_executor(max_workers=int(n_cpu*0.75), timeout=5)
         with tqdm(total=len(arg_list)) as pbar:
             for i, _ in enumerate(executor.map(do_multiproc, arg_list)):
@@ -181,8 +175,7 @@ def create_jvsmix_metadata_multiproc(jvs_dir, jvs_md_file, md_dir,
             else:
                 tmp_df.to_csv(save_path+'.csv',
                               index=None, header=None, mode='a')
-        # os.system('rm -rf ' + os.path.join(save_path, 'tmp'))
-        break
+        os.system('rm -rf ' + os.path.join(os.path.split(save_path)[0], 'tmp'))
 
 
 def make_combs(jvs_md, n_src):
@@ -205,6 +198,11 @@ def read_sources(comb, jvs_md, jvs_dir, jsut_name, n_src, subset):
     lengths = list(itertools.product(*length_list))
     path_list = [list(subdfs[i]['path']) for i in range(n_src)]
     paths = list(itertools.product(*path_list))
+
+    # Randomly select 50 mixtures for each speaker combination
+    indices_to_keep = random.choices(list(range(len(paths))), k=50)
+    lengths = [lengths[i] for i in indices_to_keep]
+    paths = [paths[i] for i in indices_to_keep]
     
     # Generate mixture ids
     mixture_ids = []
